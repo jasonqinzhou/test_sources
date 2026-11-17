@@ -1,0 +1,107 @@
+# Isolated live verification of ai-dynamo/aisim PR #895.
+# Controller source is immutable and hash-verified; no production secrets/runners.
+name: Full CI
+on:
+  push:
+    branches: [release/codex-pr895-advisory-20261117-1741]
+permissions: {}
+jobs:
+  required-probe:
+    name: Required blocking probe
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    steps:
+      - name: Deliberately fail only in the blocking scenario
+        shell: bash
+        run: |
+          echo "probe_started=$(date -u +%FT%TZ) case=advisory"
+          sleep 75
+          echo "probe_finished=$(date -u +%FT%TZ)"
+          if [ 'advisory' = blocking ]; then
+            echo 'Deliberate blocking failure for PR #895 canary'
+            exit 1
+          fi
+  slow-siblings:
+    name: Long sibling (${{ matrix.slot }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        slot: [1, 2]
+    steps:
+      - name: Work that should be canceled only in the blocking scenario
+        shell: bash
+        run: |
+          echo "sibling_started=$(date -u +%FT%TZ) slot=${{ matrix.slot }}"
+          for n in $(seq 1 5); do
+            sleep 15
+            echo "heartbeat=$n at=$(date -u +%FT%TZ)"
+          done
+          echo "sibling_finished=$(date -u +%FT%TZ)"
+  advisory:
+    name: Collector Data / Perf data sanity (informational)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    continue-on-error: true
+    steps:
+      - name: Deliberately fail only the informational probe
+        shell: bash
+        run: |
+          sleep 10
+          echo "advisory_finished=$(date -u +%FT%TZ) case=advisory"
+          if [ 'advisory' = advisory ]; then
+            echo 'Deliberate informational failure; required validation must continue'
+            exit 1
+          fi
+  readiness:
+    name: Full CI Success
+    needs: [required-probe, slow-siblings, advisory]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Keep required validation unsuccessful after cancellation/failure
+        env:
+          REQUIRED: ${{ needs.required-probe.result }}
+          SIBLINGS: ${{ needs.slow-siblings.result }}
+        run: |
+          echo "gate_started=$(date -u +%FT%TZ) required=$REQUIRED siblings=$SIBLINGS"
+          test "$REQUIRED" = success
+          test "$SIBLINGS" = success
+  controller:
+    name: Exact PR 895 controller
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Run unmodified controller against this real Actions run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_SOURCE_SHA: 96e827953ac04c51281e4bbbbd1bf13b701ff6de
+          PR_CONTROLLER_SHA256: 2326db19ed1bdd9328932dad1a7934476ebc254d6405f60aa6fb69878bae7300
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess, urllib.request
+          source = 'https://raw.githubusercontent.com/ai-dynamo/aisim/' + os.environ['PR_SOURCE_SHA'] + '/scripts/ci/watch_full_ci.py'
+          code = urllib.request.urlopen(source, timeout=30).read()
+          actual = hashlib.sha256(code).hexdigest()
+          if actual != os.environ['PR_CONTROLLER_SHA256']:
+              raise SystemExit('Controller source checksum mismatch')
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'pr895-canary'
+          root.mkdir(exist_ok=True)
+          script = root / 'watch_full_ci.py'
+          script.write_bytes(code)
+          repository = os.environ['GITHUB_REPOSITORY']
+          run_id = os.environ['GITHUB_RUN_ID']
+          run = json.loads(subprocess.check_output(['gh','api',f'repos/{repository}/actions/runs/{run_id}'], text=True))
+          event = root / 'workflow-run-event.json'
+          event.write_text(json.dumps({'action':'in_progress','repository':{'full_name':repository},'workflow_run':run}))
+          env = dict(os.environ, GITHUB_EVENT_NAME='workflow_run', GITHUB_EVENT_PATH=str(event))
+          print(json.dumps({'canary_case':'advisory','controller_source_sha':os.environ['PR_SOURCE_SHA'],'controller_sha256':actual,'target_run_id':run['id'],'target_attempt':run['run_attempt'],'target_head_sha':run['head_sha'],'target_branch':run['head_branch']}), flush=True)
+          raise SystemExit(subprocess.call(['python3','-u',str(script)], env=env))
+          PY
